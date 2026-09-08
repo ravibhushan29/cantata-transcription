@@ -63,17 +63,110 @@ Steps are idempotent per AGENTS.md — no pre-flight dedupe check.
 
 ## Architecture
 
-```
-Step.run() → None | StepResult
-     ↓
-Orchestrator
-  ├─ TRANSIENT + retries left → schedule_retry (next_retry_at)
-  └─ else → embed_dlq (CRASHED)
+### System overview
 
-Scheduler (every 30s) → dispatch due retries
-Reconciler → XQ ⊄ steps_state → embed
-Retention → steps_state.dlq > 90d → record table
+```mermaid
+flowchart TB
+    subgraph Operator
+        ONCALL[On-call engineer]
+    end
+
+    subgraph API["FastAPI (api)"]
+        PIP["/pipelines"]
+        DLQ["/dlq"]
+        MET["/metrics"]
+    end
+
+    subgraph Worker["Dramatiq worker"]
+        ACTOR["run_step actor"]
+        ORCH[Orchestrator]
+        STEPS[Pipeline steps]
+        MW["DLQArchivalMiddleware\n(after_nack)"]
+    end
+
+    subgraph SchedulerSvc["DLQ scheduler"]
+        TICK["dlq_maintenance_tick"]
+        REC[Reconciler]
+        AUTO[Auto-retry dispatch]
+        RET[Retention]
+    end
+
+    subgraph Redis
+        Q["dramatiq:default queue"]
+        XQ["dramatiq:default.XQ\n(dead letters)"]
+    end
+
+    subgraph Postgres
+        PIPE_TBL["pipeline\nsteps_state.dlq\nsteps_state.retry"]
+        REC_TBL["record\n(dlq_archive)"]
+    end
+
+    ONCALL --> DLQ
+    ONCALL --> MET
+    ONCALL --> PIP
+
+    PIP --> PIPE_TBL
+    DLQ --> XQ
+    DLQ --> PIPE_TBL
+    MET --> XQ
+    MET --> PIPE_TBL
+
+    PIP -->|dispatch_step| Q
+    DLQ -->|replay| Q
+
+    Q --> ACTOR
+    ACTOR --> ORCH --> STEPS
+    STEPS -->|None / soft fail| ORCH
+    ORCH -->|schedule_retry| PIPE_TBL
+    ORCH -->|embed_dlq| PIPE_TBL
+    ORCH -->|success: next step| Q
+
+    ACTOR -.->|uncaught raise| MW
+    MW --> XQ
+    MW --> PIPE_TBL
+
+    TICK --> REC --> XQ
+    TICK --> AUTO --> Q
+    TICK --> RET --> REC_TBL
+    AUTO --> PIPE_TBL
 ```
+
+### Failure & retry flow
+
+```mermaid
+flowchart TD
+    START[Step.run] --> RESULT{Result?}
+    RESULT -->|success| NEXT[Mark COMPLETED\nDispatch next step]
+    RESULT -->|None / soft fail| CLASS[classify failure]
+    CLASS --> TRANSIENT{TRANSIENT\nand retries left?}
+    TRANSIENT -->|yes| SCHED[schedule_retry\nnext_retry_at in steps_state]
+    TRANSIENT -->|no| DLQ[embed_dlq\nstatus = CRASHED]
+    SCHED --> WAIT[Scheduler tick\nPOST /dlq/reconcile]
+    WAIT -->|due| REDISPATCH[run_step.send]
+    REDISPATCH --> START
+    DLQ --> OPS[Operator: GET /dlq]
+    OPS --> SAFE{failure_class\nreplayable?}
+    SAFE -->|yes| REPLAY[POST /dlq/id/replay]
+    SAFE -->|no| DISCARD[DELETE /dlq/id\nor fix manually]
+    REPLAY --> REDISPATCH
+```
+
+### Data stores (DLQ)
+
+| Store | Role |
+|-------|------|
+| **Redis XQ** | Dramatiq dead-letter buffer (`dramatiq:default.XQ` + `.XQ.msgs`) |
+| **`pipeline.steps_state.dlq`** | Operator source of truth — embedded JSONB per step |
+| **`pipeline.steps_state.retry`** | Pending auto-retries (`next_retry_at`, attempt count) |
+| **`record` table** | Cold archive after 90-day retention |
+
+### Background jobs
+
+| Component | Interval | Action |
+|-----------|----------|--------|
+| **scheduler** service | 10s (configurable) | Enqueues `dlq_maintenance_tick` |
+| **dlq_maintenance_tick** | per tick | Reconcile XQ → Postgres, dispatch due retries, run retention |
+
 
 ## Assumptions documented
 
@@ -85,5 +178,5 @@ Retention → steps_state.dlq > 90d → record table
 ## Tradeoffs
 
 - **Embedded JSONB** — simple, matches AGENTS.md; production would add GIN index on `steps_state`.
-- **Scheduler polling** — 30s interval vs event-driven; adequate for assessment scale.
+- **Scheduler polling** — 10s interval (configurable) vs event-driven; adequate for assessment scale.
 - **Uniform retry budget** — POISON messages still get orchestrator retries before DLQ (could short-circuit by step in future).
