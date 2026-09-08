@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cantata
+      POSTGRES_USER: cantata
+      POSTGRES_PASSWORD: cantata
+    ports:
+      - "5432:5432"
+    volumes:
+      - cantata_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cantata -d cantata"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    command: bash -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker:
+    build: .
+    command: dramatiq app.pipeline.runner app.dlq.tasks --processes 1 --threads 4
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  scheduler:
+    build: .
+    command: bash -c "PYTHONPATH=/app python scripts/dlq_scheduler.py"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+      DLQ_SCHEDULER_INTERVAL_SECONDS: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker-stt-failure:
+    profiles: ["failure-stt"]
+    build: .
+    command: dramatiq app.pipeline.runner app.dlq.tasks --processes 1 --threads 4
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+      FAKE_STT_FAILURE_MODE: transient_5xx
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker-smtp-failure:
+    profiles: ["failure-smtp"]
+    build: .
+    command: dramatiq app.pipeline.runner app.dlq.tasks --processes 1 --threads 4
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+      FAKE_SMTP_FAILURE_MODE: transient_5xx
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker-delivery-failure:
+    profiles: ["failure-delivery"]
+    build: .
+    command: dramatiq app.pipeline.runner app.dlq.tasks --processes 1 --threads 4
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cantata:cantata@postgres:5432/cantata
+      REDIS_URL: redis://redis:6379/0
+      FAKE_DELIVERY_FAILURE_MODE: webhook_5xx
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+volumes:
+  cantata_pg:

@@ -1,0 +1,39 @@
+[project]
+name = "cantata-transcription"
+version = "0.1.0"
+description = "Cantata Transcription pipeline service"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "psycopg2-binary>=2.9.10",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "dramatiq[redis]>=1.17.0",
+    "redis>=5.2.0",
+    "httpx>=0.28.0",
+    "structlog>=24.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "pyright>=1.1.390",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pyright]
+include = ["app"]
+typeCheckingMode = "basic"
